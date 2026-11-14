@@ -1,0 +1,164 @@
+name: spiral-slab-workers
+
+# Proof for the ScrollPrize/villa pull request from the spiral-slab-workers-windows branch of
+# Cmssmc-code/villa: spiral-fitting/extract_surface_tracks.py --slab-workers on Linux and
+# macOS, upstream main against the branch, on a crop of real surface predictions.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      villa_sha:
+        description: Full SHA of the Cmssmc-code/villa commit to test (empty = BRANCH_SHA below)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  MAIN_REPO: https://github.com/ScrollPrize/villa.git
+  MAIN_SHA: 97fb9336c8898be27e78eff8cd23ce5e7185ec0a
+  BRANCH_REPO: https://github.com/Cmssmc-code/villa.git
+  BRANCH_SHA: ${{ inputs.villa_sha || '6589e78ab9c03d832dec579e6397590d38d8c360' }}
+  # PHerc0332 surface_m7 surface predictions, Vesuvius Challenge open data (public bucket).
+  PREDICTIONS: https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr
+  Z_MIN: '4032'
+  Z_MAX: '4096'
+  PYTHONUNBUFFERED: '1'
+  TQDM_MININTERVAL: '10'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the check scripts
+        uses: actions/checkout@v4
+        with:
+          path: checks
+
+      - name: Fetch spiral-fitting/ and vc_reader/ of main and of the branch (partial clones)
+        run: |
+          mkdir -p work/logs
+          fetch() {  # <directory> <repository> <commit>
+            git init -q "$1"
+            git -C "$1" remote add origin "$2"
+            git -C "$1" sparse-checkout set spiral-fitting vc_reader
+            git -C "$1" fetch -q --depth 1 --filter=blob:none origin "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+            test "$(git -C "$1" rev-parse HEAD)" = "$3"
+            git -C "$1" log -1 --format="$1: %H %s"
+          }
+          fetch villa-main "$MAIN_REPO" "$MAIN_SHA"
+          fetch villa-branch "$BRANCH_REPO" "$BRANCH_SHA"
+          echo "Files the branch changes:"
+          git -C villa-branch fetch -q --depth 1 --filter=blob:none origin "$MAIN_SHA"
+          git -C villa-branch diff --stat "$MAIN_SHA" "$BRANCH_SHA"
+          echo "vc_reader/ tree: main $(git -C villa-main rev-parse HEAD:vc_reader)," \
+            "branch $(git -C villa-branch rev-parse HEAD:vc_reader)"
+
+      - name: Python version (lower bound of requires-python in spiral-fitting/pyproject.toml)
+        id: python
+        run: |
+          lower() { sed -n 's/^requires-python *= *">=\([0-9][0-9.]*\)".*/\1/p' "$1/spiral-fitting/pyproject.toml"; }
+          main=$(lower villa-main)
+          branch=$(lower villa-branch)
+          echo "requires-python: >=$main on main, >=$branch on the branch"
+          test -n "$main" && test "$main" = "$branch"
+          echo "version=$main" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.python.outputs.version }}
+
+      - name: vc_reader build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends build-essential ninja-build pkg-config \
+            libblosc-dev libcurl4-openssl-dev libjpeg-dev liblz4-dev libpng-dev libsqlite3-dev \
+            libtiff-dev libzstd-dev nlohmann-json3-dev zlib1g-dev
+
+      - name: vc_reader build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          packages="c-blosc jpeg-turbo libpng libtiff lz4 ninja nlohmann-json zstd"
+          command -v pkg-config >/dev/null || packages="$packages pkgconf"
+          brew install $packages
+          # Build for the runner's macOS release, whose C++ library has every feature vc_reader uses.
+          echo "MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion | cut -d. -f1).0" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Python packages
+        run: |
+          python -m pip install -q -c checks/spiral-slab-workers/constraints.txt \
+            numpy scipy zarr numcodecs kimimaro connected-components-3d networkx tqdm pytest
+          python -m pip list
+
+      - name: Build and install vc_reader (from main)
+        timeout-minutes: 60
+        run: |
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(python -c 'import os; print(os.cpu_count())')
+          python -m pip install -v -c checks/spiral-slab-workers/constraints.txt \
+            --config-settings=cmake.define.VC_READER_ENABLE_CUDA=OFF ./villa-main/vc_reader \
+            > work/logs/build-vc_reader.log 2>&1 || { tail -n 200 work/logs/build-vc_reader.log; exit 1; }
+          tail -n 5 work/logs/build-vc_reader.log
+          python -c "import numpy as np; from vc_reader.geometry import label_components; print(label_components(np.eye(4, dtype=np.uint8)[None], connectivity=6)[1], 'components')"
+
+      - name: Download the predictions crop
+        run: |
+          python checks/spiral-slab-workers/fetch_predictions.py --json work/predictions.json \
+            "$PREDICTIONS" work/predictions.zarr 0 "$Z_MIN" "$Z_MAX" 2>&1 | tee work/logs/fetch.log
+
+      - name: Tests on main
+        timeout-minutes: 45
+        working-directory: villa-main/spiral-fitting
+        run: |
+          set +e
+          python -m pytest -q -rfEs -p no:cacheprovider --junitxml="$GITHUB_WORKSPACE/work/tests-main.xml" \
+            tests/test_cc_labels.py tests/test_extract_surface_tracks.py 2>&1 | tee "$GITHUB_WORKSPACE/work/logs/tests-main.log"
+          echo "${PIPESTATUS[0]}" > "$GITHUB_WORKSPACE/work/tests-main.rc"
+
+      - name: Tests on the branch
+        timeout-minutes: 45
+        working-directory: villa-branch/spiral-fitting
+        run: |
+          set +e
+          python -m pytest -q -rfEs -p no:cacheprovider --junitxml="$GITHUB_WORKSPACE/work/tests-branch.xml" \
+            tests/test_cc_labels.py tests/test_extract_surface_tracks.py 2>&1 | tee "$GITHUB_WORKSPACE/work/logs/tests-branch.log"
+          echo "${PIPESTATUS[0]}" > "$GITHUB_WORKSPACE/work/tests-branch.rc"
+
+      - name: Extraction runs and comparisons
+        timeout-minutes: 120
+        run: |
+          python checks/spiral-slab-workers/check_extraction.py villa-main villa-branch \
+            "$GITHUB_WORKSPACE/work/predictions.zarr/0" "$Z_MIN" "$Z_MAX" work
+
+      - name: Summary
+        if: always()
+        run: |
+          python checks/spiral-slab-workers/summarize.py villa-main villa-branch work | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.os }}
+          path: |
+            work/logs/
+            work/*.json
+            work/*.xml
+            work/*.rc
+          if-no-files-found: warn
