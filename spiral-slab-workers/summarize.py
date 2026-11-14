@@ -77,29 +77,25 @@ def main():
     check('tests pass on the branch',
           branch_tests and branch_tests['rc'] == 0 and branch_tests['tests'] > 0)
     for name, result in runs.items():
-        if name == 'main-sw2' and not linux:
-            continue
-        check(f'{name} finishes (exit code 0)', result['rc'] == 0)
+        if name != 'main-sw2':
+            check(f'{name} finishes (exit code 0)', result['rc'] == 0)
     check('main-default and branch-default: same keys, same tracks for every key',
           same_tracks('main-default', 'branch-default'))
     check('main-1proc and branch-1proc: same keys, identical pickled bytes for every key',
           same_bytes('main-1proc', 'branch-1proc'))
     check('branch-1proc and branch-sw2: same keys, identical pickled bytes for every key',
           same_bytes('branch-1proc', 'branch-sw2'))
+    check('main-1proc and branch-sw2: same keys, identical pickled bytes for every key',
+          same_bytes('main-1proc', 'branch-sw2'))
     if linux:
         check('branch-sw2 ran two forked slab workers at once',
               workers('branch-sw2', "forked (the run's command line)"))
-        check('main-sw2 ran two forked slab workers at once',
-              workers('main-sw2', "forked (the run's command line)"))
-        check('main-sw2 and branch-sw2: same keys, identical pickled bytes for every key',
-              same_bytes('branch-sw2', 'main-sw2'))
-        check('main-1proc and main-sw2: same keys, identical pickled bytes for every key',
-              same_bytes('main-1proc', 'main-sw2'))
     else:
         check('branch-sw2 ran two spawned slab workers at once',
               workers('branch-sw2', 'spawned (spawn_main)'))
-        check('main-sw2 (main with --slab-workers 2) stops with an error',
-              runs['main-sw2']['rc'] != 0)
+    # On main, parse_args reads sys.platform without importing sys: NameError on every OS.
+    check('main-sw2 (main with --slab-workers 2) stops with an error',
+          runs['main-sw2']['rc'] != 0)
 
     system = platform.system()
     if system == 'Darwin':

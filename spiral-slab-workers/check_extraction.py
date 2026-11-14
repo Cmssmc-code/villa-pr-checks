@@ -37,8 +37,7 @@ PAIRS = [
     ('main-default', 'branch-default'),
     ('main-1proc', 'branch-1proc'),
     ('branch-1proc', 'branch-sw2'),
-    ('main-1proc', 'main-sw2'),
-    ('branch-sw2', 'main-sw2'),
+    ('main-1proc', 'branch-sw2'),
     ('main-1proc', 'main-default'),
 ]
 TIMEOUT = 40 * 60
